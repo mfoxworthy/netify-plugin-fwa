@@ -7,7 +7,7 @@
 
 extern "C" {
 #include <uci.h>
-#include <libnftables/nftables.h>
+#include <nftables/libnftables.h>
 }
 
 #include "nfwa-plugin.hpp"
