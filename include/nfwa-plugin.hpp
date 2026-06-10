@@ -58,15 +58,12 @@ public:
     explicit nfwaPlugin(const std::string &tag);
     ~nfwaPlugin();
 
-    void Reload() override;
-    void Entry() override;
+    virtual void *Entry(void) override;
+    virtual void ProcessFlow(ndDetectionEvent event, ndFlow *flow) override;
+    virtual void GetVersion(string &version) override;
 
-    void ProcessFlow(
-        ndPlugin::ndPluginFlowMap *flow_map,
-        ndFlow *flow,
-        ndpi_protocol &proto,
-        bool new_flow
-    ) override;
+protected:
+    void Reload() override;
 
 private:
     std::mutex config_mutex_;
@@ -83,7 +80,3 @@ private:
     void AddToSet(const std::string &set, const std::string &ip, unsigned ttl);
     void RemoveFromSet(const std::string &set, const std::string &ip);
 };
-
-extern "C" ndPlugin *CreatePlugin(const std::string &tag) {
-    return new nfwaPlugin(tag);
-}
