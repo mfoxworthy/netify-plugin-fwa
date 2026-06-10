@@ -169,9 +169,30 @@ string nfwaPlugin::MatchMapping(const ndFlow *flow) const
 
 // ── ProcessFlow (stub — implementation in Task 4) ────────────────────────────
 
-void nfwaPlugin::ProcessFlow(ndDetectionEvent /*event*/, ndFlow * /*flow*/)
+void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
 {
-    // Task 4
+    if (event == ndPluginDetection::EVENT_EXPIRING) {
+        string set = MatchMapping(flow);
+        if (!set.empty())
+            RemoveFromSet(set, flow->upper_addr.GetString());
+        return;
+    }
+
+    if (event == ndPluginDetection::EVENT_NEW ||
+        event == ndPluginDetection::EVENT_UPDATED) {
+        if (!flow->app.tag.empty() || !flow->app.category_tag.empty()) {
+            string set = MatchMapping(flow);
+            if (!set.empty()) {
+                unsigned ttl;
+                {
+                    std::lock_guard<std::mutex> lg(config_mutex_);
+                    ttl = config_.set_ttl;
+                }
+                AddToSet(set, flow->upper_addr.GetString(), ttl);
+            }
+        }
+        return;
+    }
 }
 
 // ── Plugin factory — matches ndPluginInit macro in nd-plugin.h ───────────────
