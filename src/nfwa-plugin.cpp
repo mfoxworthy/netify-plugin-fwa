@@ -167,13 +167,14 @@ string nfwaPlugin::MatchMapping(const ndFlow *flow) const
     return {};
 }
 
-// ── ProcessFlow (stub — implementation in Task 4) ────────────────────────────
+// ── ProcessFlow ──────────────────────────────────────────────────────────────
 
 void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
 {
     if (event == ndPluginDetection::EVENT_EXPIRING) {
         string set = MatchMapping(flow);
         if (!set.empty())
+            // upper_addr is the server (responding) side — the destination IP we route by
             RemoveFromSet(set, flow->upper_addr.GetString());
         return;
     }
@@ -188,6 +189,7 @@ void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
                     std::lock_guard<std::mutex> lg(config_mutex_);
                     ttl = config_.set_ttl;
                 }
+                // upper_addr is the server (responding) side — the destination IP we route by
                 AddToSet(set, flow->upper_addr.GetString(), ttl);
             }
         }
