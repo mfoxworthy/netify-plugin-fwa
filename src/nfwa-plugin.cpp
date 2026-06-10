@@ -174,9 +174,6 @@ void nfwaPlugin::ProcessFlow(ndDetectionEvent /*event*/, ndFlow * /*flow*/)
     // Task 4
 }
 
-// ── Plugin factory (loaded by netifyd via dlopen/dlsym) ──────────────────────
+// ── Plugin factory — matches ndPluginInit macro in nd-plugin.h ───────────────
 
-extern "C" ndPlugin *CreatePlugin(const string &tag)
-{
-    return new nfwaPlugin(tag);
-}
+ndPluginInit(nfwaPlugin);
