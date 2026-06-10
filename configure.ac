@@ -15,14 +15,12 @@ LT_INIT([disable-static])
 AX_CXX_COMPILE_STDCXX([17], [noext], [mandatory])
 
 PKG_CHECK_MODULES([LIBNETIFYD], [libnetifyd])
+PKG_CHECK_MODULES([LIBNFTABLES], [libnftables])
 
 AC_ARG_ENABLE([package],
     [AS_HELP_STRING([--enable-package], [build the plugin .so (needs libuci)])],
     [enable_package=$enableval], [enable_package=no])
 AM_CONDITIONAL([BUILD_PACKAGE], [test "x$enable_package" = "xyes"])
-
-AS_IF([test "x$enable_package" = "xyes"],
-    [PKG_CHECK_MODULES([LIBNFTABLES], [libnftables])])
 
 AC_CONFIG_FILES([Makefile src/Makefile])
 AC_OUTPUT
