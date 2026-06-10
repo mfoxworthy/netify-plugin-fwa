@@ -1,0 +1,2 @@
+config globals 'globals'
+	option set_ttl '120'
