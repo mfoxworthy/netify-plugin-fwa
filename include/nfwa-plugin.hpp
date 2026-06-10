@@ -1,15 +1,35 @@
 // netify-plugin-fwa — firewall agent plugin (netifyd 4.4.7 API)
 #pragma once
 
-// STL — must precede netifyd headers (they use bare identifiers)
+// STL — must precede all netifyd 4.4.7 headers; they use bare identifiers
+// and rely on these being in scope.
+#include <atomic>
+#include <bitset>
 #include <map>
 #include <mutex>
+#include <regex>
+#include <set>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // System
+#include <dlfcn.h>
+#include <linux/if_packet.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 // pcap (required by nd-*.h)
 #include <pcap/pcap.h>
