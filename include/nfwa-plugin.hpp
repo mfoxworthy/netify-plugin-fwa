@@ -66,7 +66,7 @@ protected:
     void Reload() override;
 
 private:
-    std::mutex config_mutex_;
+    mutable std::mutex config_mutex_;
     NfwaConfig config_;
 
     struct nft_ctx *nft_ctx_ = nullptr;

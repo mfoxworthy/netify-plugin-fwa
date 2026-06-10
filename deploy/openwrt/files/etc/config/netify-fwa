@@ -1,2 +1,14 @@
 config globals 'globals'
 	option set_ttl '120'
+
+config mapping
+	option app_category 'voip-video'
+	option set          'sdwrt_interactive'
+
+config mapping
+	option app_category 'network-protocol'
+	option set          'sdwrt_interactive'
+
+config mapping
+	option application  'netify.zoom'
+	option set          'sdwrt_interactive'
