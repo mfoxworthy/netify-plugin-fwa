@@ -61,11 +61,13 @@ using json = nlohmann::json;
 
 constexpr unsigned _NFWA_PLUGIN_VER = 0x20260609;
 
-// A single UCI mapping entry: app tag or category tag → nftables set name
+// A single UCI mapping entry: app tag or category tag → nftables set name.
+// For APP_CATEGORY, cat_id is resolved from the apps JSON at load time.
 struct NfwaMapping {
     enum Type { APP_TAG, APP_CATEGORY } type;
-    std::string key;  // e.g. "netify.zoom" or "voip-video"
-    std::string set;  // e.g. "sdwrt_interactive"
+    std::string key;       // e.g. "netify.zoom" or "voip-video" (tag string)
+    std::string set;       // e.g. "sdwrt_interactive"
+    nd_cat_id_t cat_id = 0; // resolved category id (APP_CATEGORY only)
 };
 
 struct NfwaConfig {
@@ -82,16 +84,17 @@ public:
     virtual void ProcessFlow(ndDetectionEvent event, ndFlow *flow) override;
     virtual void GetVersion(string &version) override;
 
-protected:
-    void Reload() override;
-
 private:
     mutable std::mutex config_mutex_;
     NfwaConfig config_;
+    // category tag → id map, loaded from netifyd apps JSON
+    std::unordered_map<std::string, nd_cat_id_t> cat_tag_to_id_;
 
     struct nft_ctx *nft_ctx_ = nullptr;
 
+    void Reload();
     void LoadConfig();
+    void LoadCategoryMap();
     void InitNftables();
 
     // Returns the nftables set name if this flow matches a mapping, else "".

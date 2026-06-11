@@ -3,6 +3,7 @@
 #endif
 
 #include <cstring>
+#include <fstream>
 #include <string>
 
 extern "C" {
@@ -41,13 +42,47 @@ void nfwaPlugin::GetVersion(string &version)
     version = PACKAGE_VERSION;
 }
 
-// ── Reload (called on startup and SIGHUP by netifyd) ─────────────────────────
+// ── Reload (called on startup) ────────────────────────────────────────────────
 
 void nfwaPlugin::Reload()
 {
+    LoadCategoryMap();
     LoadConfig();
     nd_printf("%s: config loaded, %zu mappings, ttl=%us\n",
         GetTag().c_str(), config_.mappings.size(), config_.set_ttl);
+}
+
+// ── LoadCategoryMap ───────────────────────────────────────────────────────────
+// Reads the netifyd apps JSON to build a category-tag → id map.
+// The file contains an "application_tag_index" object: { "tag": id, ... }
+
+void nfwaPlugin::LoadCategoryMap()
+{
+    const std::string path = std::string(ND_DATADIR) + "/netifyd-apps.json";
+    std::unordered_map<std::string, nd_cat_id_t> m;
+
+    std::ifstream f(path);
+    if (f.is_open()) {
+        try {
+            auto j = json::parse(f);
+            auto it = j.find("application_tag_index");
+            if (it != j.end()) {
+                for (auto &kv : it->items())
+                    m[kv.key()] = (nd_cat_id_t)kv.value().get<unsigned>();
+            }
+            nd_printf("%s: loaded %zu category tags from %s\n",
+                GetTag().c_str(), m.size(), path.c_str());
+        } catch (const std::exception &ex) {
+            nd_printf("%s: warning: failed to parse %s: %s\n",
+                GetTag().c_str(), path.c_str(), ex.what());
+        }
+    } else {
+        nd_printf("%s: warning: apps JSON not found: %s\n",
+            GetTag().c_str(), path.c_str());
+    }
+
+    std::lock_guard<std::mutex> lg(config_mutex_);
+    cat_tag_to_id_ = std::move(m);
 }
 
 // ── LoadConfig ───────────────────────────────────────────────────────────────
@@ -92,6 +127,16 @@ void nfwaPlugin::LoadConfig()
             } else if (cat_opt && cat_opt->type == UCI_TYPE_STRING) {
                 m.type = NfwaMapping::APP_CATEGORY;
                 m.key  = cat_opt->v.string;
+                // Resolve tag → id while we still hold cat_tag_to_id_
+                {
+                    std::lock_guard<std::mutex> lg(config_mutex_);
+                    auto it = cat_tag_to_id_.find(m.key);
+                    if (it != cat_tag_to_id_.end())
+                        m.cat_id = it->second;
+                    else
+                        nd_printf("%s: warning: unknown category tag '%s'\n",
+                            GetTag().c_str(), m.key.c_str());
+                }
                 cfg.mappings.push_back(m);
             }
         }
@@ -154,13 +199,18 @@ void nfwaPlugin::RemoveFromSet(const string &set, const string &ip)
 
 string nfwaPlugin::MatchMapping(const ndFlow *flow) const
 {
+    // flow->detected_application_name is the app tag string (e.g. "netify.zoom")
+    const char *app_tag = flow->detected_application_name;
+    // flow->category.application is the numeric category id
+    nd_cat_id_t cat_id = flow->category.application;
+
     std::lock_guard<std::mutex> lg(config_mutex_);
     for (const auto &m : config_.mappings) {
         if (m.type == NfwaMapping::APP_TAG) {
-            if (!flow->app.tag.empty() && flow->app.tag == m.key)
+            if (app_tag && app_tag[0] != '\0' && m.key == app_tag)
                 return m.set;
         } else {
-            if (!flow->app.category_tag.empty() && flow->app.category_tag == m.key)
+            if (m.cat_id != 0 && cat_id == m.cat_id)
                 return m.set;
         }
     }
@@ -181,7 +231,11 @@ void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
 
     if (event == ndPluginDetection::EVENT_NEW ||
         event == ndPluginDetection::EVENT_UPDATED) {
-        if (!flow->app.tag.empty() || !flow->app.category_tag.empty()) {
+        // Only act on flows that have been classified (app name or category set)
+        bool has_app = (flow->detected_application_name != nullptr &&
+                        flow->detected_application_name[0] != '\0');
+        bool has_cat = (flow->category.application != 0);
+        if (has_app || has_cat) {
             string set = MatchMapping(flow);
             if (!set.empty()) {
                 unsigned ttl;
