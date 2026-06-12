@@ -59,19 +59,26 @@ using json = nlohmann::json;
 #include <nd-flow-map.h>
 #include <nd-plugin.h>
 
-constexpr unsigned _NFWA_PLUGIN_VER = 0x20260609;
+constexpr unsigned _NFWA_PLUGIN_VER = 0x20260612;
 
-// A single UCI mapping entry: app tag or category tag → nftables set name.
-// For APP_CATEGORY, cat_id is resolved from the apps JSON at load time.
+// Netify API base URL and cache paths
+#define NFWA_API_BASE      "https://api.netify.ai/api/v1"
+#define NFWA_CACHE_APPS    "/etc/netify.d/netify-fwa-app-proto.json"
+#define NFWA_CACHE_CATIDX  "/etc/netify.d/netify-fwa-cat-index.json"
+#define NFWA_CACHE_TTL     86400  // 24 hours, matching Python agent
+
+// A single UCI mapping entry: application tag or category tag → nftables set name.
+// app_id and cat_id are resolved from the downloaded Netify API data at load time.
 struct NfwaMapping {
     enum Type { APP_TAG, APP_CATEGORY } type;
-    std::string key;       // e.g. "netify.zoom" or "voip-video" (tag string)
-    std::string set;       // e.g. "sdwrt_interactive"
-    nd_cat_id_t cat_id = 0; // resolved category id (APP_CATEGORY only)
+    std::string key;                    // original tag string (for logging)
+    std::string set;                    // nftables set name
+    nd_app_id_t app_id = ND_APP_UNKNOWN; // resolved for APP_TAG
+    nd_cat_id_t cat_id = 0;              // resolved for APP_CATEGORY
 };
 
 struct NfwaConfig {
-    unsigned set_ttl = 120;               // nftables element TTL in seconds
+    unsigned set_ttl = 120;
     std::vector<NfwaMapping> mappings;
 };
 
@@ -87,18 +94,27 @@ public:
 private:
     mutable std::mutex config_mutex_;
     NfwaConfig config_;
-    // category tag → id map, loaded from netifyd apps JSON
-    std::unordered_map<std::string, nd_cat_id_t> cat_tag_to_id_;
+
+    // Maps populated from Netify API data (same data as Python agent's
+    // app-proto-data.json and category-index.json)
+    std::unordered_map<std::string, nd_app_id_t> app_tag_to_id_;  // "netify.zoom" → 10228
+    std::unordered_map<nd_app_id_t, nd_cat_id_t> app_id_to_cat_;  // 10228 → 32
+    std::unordered_map<std::string, nd_cat_id_t> cat_tag_to_id_;  // "voip" → 32
 
     struct nft_ctx *nft_ctx_ = nullptr;
 
     void Reload();
     void LoadConfig();
-    void LoadCategoryMap();
+    void LoadNetifyData();
+    bool NeedsRefresh() const;
+    bool FetchPage(const std::string &url, json &result);
+    bool FetchPaginated(const std::string &endpoint, json &items);
+    void DownloadNetifyData();
     void InitNftables();
 
-    // Returns the nftables set name if this flow matches a mapping, else "".
-    std::string MatchMapping(const ndFlow *flow) const;
+    // Returns {set_name, ttl} for the first matching mapping, or {"", 0}.
+    // Mirrors flow_matches() + process_flow() logic from the Python agent.
+    std::pair<std::string, unsigned> FindMatchingSet(const ndFlow *flow) const;
 
     void AddToSet(const std::string &set, const std::string &ip, unsigned ttl);
     void RemoveFromSet(const std::string &set, const std::string &ip);

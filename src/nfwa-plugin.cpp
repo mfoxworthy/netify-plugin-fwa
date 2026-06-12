@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 extern "C" {
@@ -25,7 +26,9 @@ nfwaPlugin::nfwaPlugin(const string &tag)
         throw std::runtime_error("nfwaPlugin: failed to create nft context");
     nft_ctx_output_set_flags(nft_ctx_, NFT_CTX_OUTPUT_JSON);
 
-    Reload();
+    // Load whatever API data is already cached; Entry() will refresh if stale.
+    LoadNetifyData();
+    LoadConfig();
     InitNftables();
 }
 
@@ -42,55 +45,242 @@ void nfwaPlugin::GetVersion(string &version)
     version = PACKAGE_VERSION;
 }
 
-// ── Reload (called on startup) ────────────────────────────────────────────────
+// ── Reload ───────────────────────────────────────────────────────────────────
 
 void nfwaPlugin::Reload()
 {
-    LoadCategoryMap();
+    LoadNetifyData();
     LoadConfig();
-    nd_printf("%s: config loaded, %zu mappings, ttl=%us\n",
-        GetTag().c_str(), config_.mappings.size(), config_.set_ttl);
+    nd_printf("%s: reloaded, %zu mappings\n",
+        GetTag().c_str(), config_.mappings.size());
 }
 
-// ── LoadCategoryMap ───────────────────────────────────────────────────────────
-// Reads the netifyd apps JSON to build a category-tag → id map.
-// The file contains an "application_tag_index" object: { "tag": id, ... }
+// ── NeedsRefresh ─────────────────────────────────────────────────────────────
+// True if the API cache is missing or older than NFWA_CACHE_TTL seconds.
 
-void nfwaPlugin::LoadCategoryMap()
+bool nfwaPlugin::NeedsRefresh() const
 {
-    // Try canonical path first, then the standard OpenWrt netify data dir.
-    // The file format is identical — both contain "application_tag_index".
-    const std::vector<std::string> candidates = {
-        std::string(ND_DATADIR) + "/netifyd-apps.json",
-        "/etc/netify.d/netify-categories.json",
-    };
+    struct stat st;
+    if (stat(NFWA_CACHE_CATIDX, &st) != 0) return true;
+    return (time(nullptr) - st.st_mtime) > NFWA_CACHE_TTL;
+}
 
-    std::unordered_map<std::string, nd_cat_id_t> m;
+// ── FetchPage ─────────────────────────────────────────────────────────────────
+// Downloads a single URL via uclient-fetch and parses the JSON response.
+// Returns false if the fetch fails or the API status_code is non-zero.
 
-    for (const auto &path : candidates) {
-        std::ifstream f(path);
-        if (!f.is_open()) continue;
-        try {
-            auto j = json::parse(f);
-            auto it = j.find("application_tag_index");
-            if (it == j.end()) continue;
-            for (auto &kv : it->items())
-                m[kv.key()] = (nd_cat_id_t)kv.value().get<unsigned>();
-            nd_printf("%s: loaded %zu category tags from %s\n",
-                GetTag().c_str(), m.size(), path.c_str());
-            break;
-        } catch (const std::exception &ex) {
-            nd_printf("%s: warning: failed to parse %s: %s\n",
-                GetTag().c_str(), path.c_str(), ex.what());
+bool nfwaPlugin::FetchPage(const string &url, json &result)
+{
+    char cmd[2048];
+    // Single-quote the URL so the shell won't interpret & or ?
+    snprintf(cmd, sizeof(cmd),
+        "uclient-fetch -q -T 30 -O - '%s' 2>/dev/null",
+        url.c_str());
+
+    FILE *f = popen(cmd, "r");
+    if (!f) return false;
+
+    string output;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        output.append(buf, n);
+    int rc = pclose(f);
+
+    if (output.empty() || rc != 0) return false;
+
+    try {
+        result = json::parse(output);
+        return (result.value("status_code", -1) == 0);
+    } catch (...) {
+        nd_printf("%s: warning: JSON parse error from %s\n",
+            GetTag().c_str(), url.c_str());
+        return false;
+    }
+}
+
+// ── FetchPaginated ────────────────────────────────────────────────────────────
+// Downloads all pages of a paginated Netify API endpoint.
+// items is populated with the merged contents of each page's "data" array.
+
+bool nfwaPlugin::FetchPaginated(const string &endpoint, json &items)
+{
+    items = json::array();
+    int page = 1, total_pages = 1;
+
+    do {
+        char url[2048];
+        snprintf(url, sizeof(url),
+            "%s%s?settings_limit=100&page=%d",
+            NFWA_API_BASE, endpoint.c_str(), page);
+
+        json page_result;
+        if (!FetchPage(url, page_result)) {
+            nd_printf("%s: warning: failed to fetch %s page %d\n",
+                GetTag().c_str(), endpoint.c_str(), page);
+            return false;
+        }
+
+        if (page == 1 && page_result.contains("data_info"))
+            total_pages = page_result["data_info"].value("total_pages", 1);
+
+        const auto &data = page_result["data"];
+        if (data.is_array())
+            items.insert(items.end(), data.begin(), data.end());
+        else if (data.is_object())
+            for (auto &[k, v] : data.items())
+                items.push_back(v);
+
+        page++;
+    } while (page <= total_pages && !ShouldTerminate());
+
+    return true;
+}
+
+// ── DownloadNetifyData ────────────────────────────────────────────────────────
+// Mirrors nfa_task.cat_update from the Python agent:
+//   - Downloads /lookup/applications (all pages)
+//   - Downloads /lookup/application-categories
+//   - Saves app-proto-data and category-index cache files
+//   - Reloads the in-memory maps and config
+
+void nfwaPlugin::DownloadNetifyData()
+{
+    nd_printf("%s: downloading app/category data from Netify API...\n",
+        GetTag().c_str());
+
+    json apps, cats;
+
+    if (!FetchPaginated("/lookup/applications", apps)) {
+        nd_printf("%s: warning: failed to download applications, keeping cached data\n",
+            GetTag().c_str());
+        return;
+    }
+
+    if (!FetchPaginated("/lookup/application-categories", cats)) {
+        nd_printf("%s: warning: failed to download categories, keeping cached data\n",
+            GetTag().c_str());
+        return;
+    }
+
+    // Build app-proto-data (mirrors Python metadata dict)
+    json app_proto;
+    app_proto["application_tags"]         = json::object();
+    app_proto["application_category_tags"] = json::object();
+
+    for (const auto &app : apps) {
+        if (!app.contains("id") || !app.contains("tag")) continue;
+        if (!app.contains("application_category")) continue;
+
+        nd_app_id_t id = app["id"].get<nd_app_id_t>();
+        string tag     = app["tag"].get<string>();
+        app_proto["application_tags"][tag] = id;
+    }
+
+    for (const auto &cat : cats) {
+        if (!cat.contains("id") || !cat.contains("tag")) continue;
+        string tag     = cat["tag"].get<string>();
+        nd_cat_id_t id = cat["id"].get<nd_cat_id_t>();
+        app_proto["application_category_tags"][tag] = id;
+    }
+
+    // Build category-index (mirrors Python category-index.json)
+    json cat_index;
+    cat_index["applications"] = json::object();
+
+    for (const auto &app : apps) {
+        if (!app.contains("id")) continue;
+        if (!app.contains("application_category")) continue;
+
+        nd_app_id_t id     = app["id"].get<nd_app_id_t>();
+        nd_cat_id_t cat_id = app["application_category"]["id"].get<nd_cat_id_t>();
+        cat_index["applications"][to_string(id)] = cat_id;
+    }
+
+    // Save to cache files
+    try {
+        ofstream fa(NFWA_CACHE_APPS);
+        fa << app_proto.dump();
+    } catch (...) {
+        nd_printf("%s: warning: could not write %s\n", GetTag().c_str(), NFWA_CACHE_APPS);
+    }
+    try {
+        ofstream fc(NFWA_CACHE_CATIDX);
+        fc << cat_index.dump();
+    } catch (...) {
+        nd_printf("%s: warning: could not write %s\n", GetTag().c_str(), NFWA_CACHE_CATIDX);
+    }
+
+    nd_printf("%s: downloaded %zu apps, %zu categories\n",
+        GetTag().c_str(), apps.size(), cats.size());
+
+    // Reload maps and re-resolve config tags with fresh data
+    Reload();
+}
+
+// ── LoadNetifyData ────────────────────────────────────────────────────────────
+// Loads the cached app-proto-data and category-index files into the three
+// in-memory maps.  Called at startup and after each DownloadNetifyData().
+
+void nfwaPlugin::LoadNetifyData()
+{
+    unordered_map<string, nd_app_id_t> new_app_tag;
+    unordered_map<nd_app_id_t, nd_cat_id_t> new_app_cat;
+    unordered_map<string, nd_cat_id_t> new_cat_tag;
+
+    // app-proto-data: application_tags and application_category_tags
+    {
+        ifstream f(NFWA_CACHE_APPS);
+        if (f.is_open()) {
+            try {
+                auto j = json::parse(f);
+
+                if (j.contains("application_tags")) {
+                    for (auto &[tag, id] : j["application_tags"].items())
+                        new_app_tag[tag] = id.get<nd_app_id_t>();
+                }
+
+                if (j.contains("application_category_tags")) {
+                    for (auto &[tag, id] : j["application_category_tags"].items())
+                        new_cat_tag[tag] = id.get<nd_cat_id_t>();
+                }
+
+                nd_printf("%s: loaded %zu app tags, %zu category tags from cache\n",
+                    GetTag().c_str(), new_app_tag.size(), new_cat_tag.size());
+            } catch (const exception &ex) {
+                nd_printf("%s: warning: could not parse %s: %s\n",
+                    GetTag().c_str(), NFWA_CACHE_APPS, ex.what());
+            }
         }
     }
 
-    if (m.empty())
-        nd_printf("%s: warning: no category tag map found; category mappings disabled\n",
-            GetTag().c_str());
+    // category-index: applications map  { "10228": 32, ... }
+    {
+        ifstream f(NFWA_CACHE_CATIDX);
+        if (f.is_open()) {
+            try {
+                auto j = json::parse(f);
 
-    std::lock_guard<std::mutex> lg(config_mutex_);
-    cat_tag_to_id_ = std::move(m);
+                if (j.contains("applications")) {
+                    for (auto &[id_str, cat_id] : j["applications"].items()) {
+                        nd_app_id_t app_id = (nd_app_id_t)stoul(id_str);
+                        new_app_cat[app_id] = cat_id.get<nd_cat_id_t>();
+                    }
+                }
+
+                nd_printf("%s: loaded %zu app→category entries from cache\n",
+                    GetTag().c_str(), new_app_cat.size());
+            } catch (const exception &ex) {
+                nd_printf("%s: warning: could not parse %s: %s\n",
+                    GetTag().c_str(), NFWA_CACHE_CATIDX, ex.what());
+            }
+        }
+    }
+
+    lock_guard<mutex> lg(config_mutex_);
+    app_tag_to_id_ = move(new_app_tag);
+    app_id_to_cat_ = move(new_app_cat);
+    cat_tag_to_id_ = move(new_cat_tag);
 }
 
 // ── LoadConfig ───────────────────────────────────────────────────────────────
@@ -128,22 +318,31 @@ void nfwaPlugin::LoadConfig()
             if (!set_opt || set_opt->type != UCI_TYPE_STRING) continue;
             m.set = set_opt->v.string;
 
+            lock_guard<mutex> lg(config_mutex_);
+
             if (app_opt && app_opt->type == UCI_TYPE_STRING) {
                 m.type = NfwaMapping::APP_TAG;
                 m.key  = app_opt->v.string;
+                auto it = app_tag_to_id_.find(m.key);
+                if (it != app_tag_to_id_.end()) {
+                    m.app_id = it->second;
+                } else {
+                    nd_printf("%s: warning: unknown application tag '%s' "
+                              "(API data not yet downloaded?)\n",
+                              GetTag().c_str(), m.key.c_str());
+                }
                 cfg.mappings.push_back(m);
+
             } else if (cat_opt && cat_opt->type == UCI_TYPE_STRING) {
                 m.type = NfwaMapping::APP_CATEGORY;
                 m.key  = cat_opt->v.string;
-                // Resolve tag → id while we still hold cat_tag_to_id_
-                {
-                    std::lock_guard<std::mutex> lg(config_mutex_);
-                    auto it = cat_tag_to_id_.find(m.key);
-                    if (it != cat_tag_to_id_.end())
-                        m.cat_id = it->second;
-                    else
-                        nd_printf("%s: warning: unknown category tag '%s'\n",
-                            GetTag().c_str(), m.key.c_str());
+                auto it = cat_tag_to_id_.find(m.key);
+                if (it != cat_tag_to_id_.end()) {
+                    m.cat_id = it->second;
+                } else {
+                    nd_printf("%s: warning: unknown category tag '%s' "
+                              "(API data not yet downloaded?)\n",
+                              GetTag().c_str(), m.key.c_str());
                 }
                 cfg.mappings.push_back(m);
             }
@@ -152,16 +351,19 @@ void nfwaPlugin::LoadConfig()
 
     uci_free_context(ctx);
 
-    std::lock_guard<std::mutex> lg(config_mutex_);
-    config_ = std::move(cfg);
+    {
+        lock_guard<mutex> lg(config_mutex_);
+        config_ = move(cfg);
+    }
+
+    nd_printf("%s: config loaded, %zu mappings, ttl=%us\n",
+        GetTag().c_str(), config_.mappings.size(), config_.set_ttl);
 }
 
 // ── InitNftables ─────────────────────────────────────────────────────────────
 
 void nfwaPlugin::InitNftables()
 {
-    // Create table and set idempotently — "add" is a no-op if they already exist.
-    // sd-wrt-policy also does this, so both can race safely.
     const char *cmds =
         "add table inet sd_wrt\n"
         "add set inet sd_wrt sdwrt_interactive "
@@ -171,13 +373,28 @@ void nfwaPlugin::InitNftables()
         nd_printf("%s: warning: nftables init returned non-zero\n", GetTag().c_str());
 }
 
-// ── Entry (background thread — minimal, all work done in ProcessFlow) ─────────
+// ── Entry ─────────────────────────────────────────────────────────────────────
+// Background thread: mirrors nfa_cat_index_refresh from the Python agent.
+// Downloads API data if the cache is missing or stale, then refreshes hourly.
 
 void *nfwaPlugin::Entry(void)
 {
     nd_printf("%s: started\n", GetTag().c_str());
-    while (!ShouldTerminate())
-        sleep(1);
+
+    if (NeedsRefresh())
+        DownloadNetifyData();
+
+    // Check for refresh every hour, but wake every 60s to honour ShouldTerminate
+    int ticks = 0;
+    while (!ShouldTerminate()) {
+        sleep(60);
+        if (++ticks >= 60) {   // 60 × 60s = 1 hour
+            ticks = 0;
+            if (NeedsRefresh())
+                DownloadNetifyData();
+        }
+    }
+
     nd_printf("%s: stopped\n", GetTag().c_str());
     return nullptr;
 }
@@ -199,66 +416,103 @@ void nfwaPlugin::RemoveFromSet(const string &set, const string &ip)
     snprintf(cmd, sizeof(cmd),
         "delete element inet sd_wrt %s { %s }\n",
         set.c_str(), ip.c_str());
-    // Ignore errors — element may have already expired via TTL
     nft_run_cmd_from_buffer(nft_ctx_, cmd);
 }
 
-// ── MatchMapping ─────────────────────────────────────────────────────────────
+// ── FindMatchingSet ────────────────────────────────────────────────────────────
+// Mirrors flow_matches() from nfa_rule.py:
+//   - Resolves the flow's numeric app_id → category using the downloaded
+//     category-index (same as Python's config_cat_index['applications'])
+//   - Matches against APP_TAG (exact app_id) or APP_CATEGORY (category_id)
+// Returns {set_name, ttl} for the first matching rule, or {"", 0}.
 
-string nfwaPlugin::MatchMapping(const ndFlow *flow) const
+pair<string, unsigned> nfwaPlugin::FindMatchingSet(const ndFlow *flow) const
 {
-    // flow->detected_application_name is the app tag string (e.g. "netify.zoom")
-    const char *app_tag = flow->detected_application_name;
-    // flow->category.application is the numeric category id
-    nd_cat_id_t cat_id = flow->category.application;
+    nd_app_id_t app_id = flow->detected_application;
 
-    std::lock_guard<std::mutex> lg(config_mutex_);
-    for (const auto &m : config_.mappings) {
-        if (m.type == NfwaMapping::APP_TAG) {
-            if (app_tag && app_tag[0] != '\0' && m.key == app_tag)
-                return m.set;
-        } else {
-            if (m.cat_id != 0 && cat_id == m.cat_id)
-                return m.set;
-        }
+    lock_guard<mutex> lg(config_mutex_);
+
+    // Resolve app_id → category using the downloaded category-index.
+    // This mirrors:  config_cat_index['applications'][str(app_id)]
+    nd_cat_id_t app_cat = flow->category.application;
+    if (app_cat == 0 && app_id != ND_APP_UNKNOWN) {
+        auto it = app_id_to_cat_.find(app_id);
+        if (it != app_id_to_cat_.end())
+            app_cat = it->second;
     }
-    return {};
+
+    // If no classification at all, nothing to match
+    if (app_id == ND_APP_UNKNOWN && app_cat == 0)
+        return {"", 0};
+
+    for (const auto &m : config_.mappings) {
+        bool matched = false;
+        if (m.type == NfwaMapping::APP_TAG)
+            matched = (m.app_id != ND_APP_UNKNOWN && app_id == m.app_id);
+        else
+            matched = (m.cat_id != 0 && app_cat == m.cat_id);
+
+        if (matched)
+            return {m.set, config_.set_ttl};
+    }
+
+    return {"", 0};
 }
 
 // ── ProcessFlow ──────────────────────────────────────────────────────────────
+// Mirrors the flow processing loop in nfa_main.py / nfa_fw_iptables.process_flow:
+//
+//   - Only processes flows with a remote (internet) partner
+//     → flow['other_type'] == 'remote'
+//   - Only TCP, UDP, SCTP, UDPLite
+//     → flow['ip_protocol'] in {6, 17, 132, 136}
+//   - Skips DNS and MDNS
+//     → flow['detected_protocol'] not in {5, 8}
+//   - Determines the remote ("other") IP using lower_map
+//     → mirrors the _lower_ip / _upper_ip swap in ndFlow::encode()
+//   - Adds remote IP to the nftables set on NEW/UPDATED, removes on EXPIRING
 
 void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
 {
+    // Only flows that have a remote (internet) partner
+    if (flow->other_type != ndFlow::OTHER_REMOTE) return;
+
+    // Only TCP (6), UDP (17), SCTP (132), UDPLite (136)
+    if (flow->ip_protocol != 6  &&
+        flow->ip_protocol != 17 &&
+        flow->ip_protocol != 132 &&
+        flow->ip_protocol != 136) return;
+
+    // Skip DNS and MDNS — these are the resolver flows on the LAN, not
+    // application traffic.  Mirrors the Python agent's filter.
+    if (flow->detected_protocol == ND_PROTO_DNS ||
+        flow->detected_protocol == ND_PROTO_MDNS) return;
+
+    // Determine which address is the remote ("other") side.
+    // ndFlow stores lower_addr and upper_addr in numeric order; lower_map
+    // tells us which is the local (LAN) side.  This mirrors the
+    // _lower_ip / _upper_ip assignment in ndFlow::encode().
+    const ndAddr &other_addr = (flow->lower_map == ndFlow::LOWER_LOCAL)
+        ? flow->upper_addr
+        : flow->lower_addr;
+
+    const string other_ip = other_addr.GetString();
+
     if (event == ndPluginDetection::EVENT_EXPIRING) {
-        string set = MatchMapping(flow);
+        auto [set, ttl] = FindMatchingSet(flow);
         if (!set.empty())
-            // upper_addr is the server (responding) side — the destination IP we route by
-            RemoveFromSet(set, flow->upper_addr.GetString());
+            RemoveFromSet(set, other_ip);
         return;
     }
 
     if (event == ndPluginDetection::EVENT_NEW ||
         event == ndPluginDetection::EVENT_UPDATED) {
-        // Only act on flows that have been classified (app name or category set)
-        bool has_app = (flow->detected_application_name != nullptr &&
-                        flow->detected_application_name[0] != '\0');
-        bool has_cat = (flow->category.application != 0);
-        if (has_app || has_cat) {
-            string set = MatchMapping(flow);
-            if (!set.empty()) {
-                unsigned ttl;
-                {
-                    std::lock_guard<std::mutex> lg(config_mutex_);
-                    ttl = config_.set_ttl;
-                }
-                // upper_addr is the server (responding) side — the destination IP we route by
-                AddToSet(set, flow->upper_addr.GetString(), ttl);
-            }
-        }
-        return;
+        auto [set, ttl] = FindMatchingSet(flow);
+        if (!set.empty())
+            AddToSet(set, other_ip, ttl);
     }
 }
 
-// ── Plugin factory — matches ndPluginInit macro in nd-plugin.h ───────────────
+// ── Plugin factory ────────────────────────────────────────────────────────────
 
 ndPluginInit(nfwaPlugin);
