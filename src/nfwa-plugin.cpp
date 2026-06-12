@@ -58,28 +58,36 @@ void nfwaPlugin::Reload()
 
 void nfwaPlugin::LoadCategoryMap()
 {
-    const std::string path = std::string(ND_DATADIR) + "/netifyd-apps.json";
+    // Try canonical path first, then the standard OpenWrt netify data dir.
+    // The file format is identical — both contain "application_tag_index".
+    const std::vector<std::string> candidates = {
+        std::string(ND_DATADIR) + "/netifyd-apps.json",
+        "/etc/netify.d/netify-categories.json",
+    };
+
     std::unordered_map<std::string, nd_cat_id_t> m;
 
-    std::ifstream f(path);
-    if (f.is_open()) {
+    for (const auto &path : candidates) {
+        std::ifstream f(path);
+        if (!f.is_open()) continue;
         try {
             auto j = json::parse(f);
             auto it = j.find("application_tag_index");
-            if (it != j.end()) {
-                for (auto &kv : it->items())
-                    m[kv.key()] = (nd_cat_id_t)kv.value().get<unsigned>();
-            }
+            if (it == j.end()) continue;
+            for (auto &kv : it->items())
+                m[kv.key()] = (nd_cat_id_t)kv.value().get<unsigned>();
             nd_printf("%s: loaded %zu category tags from %s\n",
                 GetTag().c_str(), m.size(), path.c_str());
+            break;
         } catch (const std::exception &ex) {
             nd_printf("%s: warning: failed to parse %s: %s\n",
                 GetTag().c_str(), path.c_str(), ex.what());
         }
-    } else {
-        nd_printf("%s: warning: apps JSON not found: %s\n",
-            GetTag().c_str(), path.c_str());
     }
+
+    if (m.empty())
+        nd_printf("%s: warning: no category tag map found; category mappings disabled\n",
+            GetTag().c_str());
 
     std::lock_guard<std::mutex> lg(config_mutex_);
     cat_tag_to_id_ = std::move(m);
