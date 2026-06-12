@@ -157,7 +157,7 @@ void nfwaPlugin::DownloadNetifyData()
         return;
     }
 
-    if (!FetchPaginated("/lookup/application-categories", cats)) {
+    if (!FetchPaginated("/lookup/application_categories", cats)) {
         nd_printf("%s: warning: failed to download categories, keeping cached data\n",
             GetTag().c_str());
         return;
