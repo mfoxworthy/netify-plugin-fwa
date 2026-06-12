@@ -66,6 +66,9 @@ constexpr unsigned _NFWA_PLUGIN_VER = 0x20260612;
 #define NFWA_CACHE_APPS    "/etc/netify.d/netify-fwa-app-proto.json"
 #define NFWA_CACHE_CATIDX  "/etc/netify.d/netify-fwa-cat-index.json"
 #define NFWA_CACHE_TTL     86400  // 24 hours, matching Python agent
+// Fetch script: called with (base_url, endpoint), outputs one compact JSON line per page.
+// Using a script means uclient-fetch forks from sh (~1MB), not netifyd (141MB).
+#define NFWA_FETCH_SCRIPT  "/usr/lib/netify-plugin-fwa/nfwa-fetch.sh"
 
 // A single UCI mapping entry: application tag or category tag → nftables set name.
 // app_id and cat_id are resolved from the downloaded Netify API data at load time.
@@ -107,7 +110,6 @@ private:
     void LoadConfig();
     void LoadNetifyData();
     bool NeedsRefresh() const;
-    bool FetchPage(const std::string &url, json &result);
     bool FetchPaginated(const std::string &endpoint, json &items);
     void DownloadNetifyData();
     void InitNftables();

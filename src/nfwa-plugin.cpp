@@ -65,76 +65,69 @@ bool nfwaPlugin::NeedsRefresh() const
     return (time(nullptr) - st.st_mtime) > NFWA_CACHE_TTL;
 }
 
-// ── FetchPage ─────────────────────────────────────────────────────────────────
-// Downloads a single URL via uclient-fetch and parses the JSON response.
-// Returns false if the fetch fails or the API status_code is non-zero.
-
-bool nfwaPlugin::FetchPage(const string &url, json &result)
-{
-    char cmd[2048];
-    // Single-quote the URL so the shell won't interpret & or ?
-    snprintf(cmd, sizeof(cmd),
-        "uclient-fetch -q -T 30 -O - '%s' 2>/dev/null",
-        url.c_str());
-
-    FILE *f = popen(cmd, "r");
-    if (!f) return false;
-
-    string output;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-        output.append(buf, n);
-    int rc = pclose(f);
-
-    if (output.empty() || rc != 0) return false;
-
-    try {
-        result = json::parse(output);
-        return (result.value("status_code", -1) == 0);
-    } catch (...) {
-        nd_printf("%s: warning: JSON parse error from %s\n",
-            GetTag().c_str(), url.c_str());
-        return false;
-    }
-}
-
 // ── FetchPaginated ────────────────────────────────────────────────────────────
-// Downloads all pages of a paginated Netify API endpoint.
-// items is populated with the merged contents of each page's "data" array.
+// Downloads all pages of a paginated Netify API endpoint via a single popen()
+// call to nfwa-fetch.sh.  The script runs uclient-fetch per page from inside
+// sh (~1 MB), so we only fork netifyd (141 MB) once instead of once per page.
+// The script outputs one compact JSON object per line; we parse them as they
+// arrive so the pipe never blocks.
 
 bool nfwaPlugin::FetchPaginated(const string &endpoint, json &items)
 {
     items = json::array();
-    int page = 1, total_pages = 1;
 
-    do {
-        char url[2048];
-        snprintf(url, sizeof(url),
-            "%s%s?settings_limit=100&page=%d",
-            NFWA_API_BASE, endpoint.c_str(), page);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        NFWA_FETCH_SCRIPT " '" NFWA_API_BASE "' '%s'",
+        endpoint.c_str());
 
-        json page_result;
-        if (!FetchPage(url, page_result)) {
-            nd_printf("%s: warning: failed to fetch %s page %d\n",
-                GetTag().c_str(), endpoint.c_str(), page);
-            return false;
+    FILE *f = popen(cmd, "r");
+    if (!f) return false;
+
+    bool ok = false;
+    string line;
+    char buf[8192];
+
+    while (fgets(buf, sizeof(buf), f)) {
+        line += buf;
+        if (line.empty() || line.back() != '\n')
+            continue;  // fgets hit its buffer limit; keep accumulating
+
+        line.pop_back();  // strip trailing newline
+
+        if (line.empty() || line[0] != '{') {
+            line.clear();
+            continue;
         }
 
-        if (page == 1 && page_result.contains("data_info"))
-            total_pages = page_result["data_info"].value("total_pages", 1);
+        try {
+            auto page_result = json::parse(line);
+            line.clear();
 
-        const auto &data = page_result["data"];
-        if (data.is_array())
-            items.insert(items.end(), data.begin(), data.end());
-        else if (data.is_object())
-            for (auto &[k, v] : data.items())
-                items.push_back(v);
+            if (page_result.value("status_code", -1) != 0) {
+                nd_printf("%s: warning: API error from %s\n",
+                    GetTag().c_str(), endpoint.c_str());
+                pclose(f);
+                return false;
+            }
 
-        page++;
-    } while (page <= total_pages && !ShouldTerminate());
+            const auto &data = page_result["data"];
+            if (data.is_array())
+                items.insert(items.end(), data.begin(), data.end());
+            else if (data.is_object())
+                for (auto &[k, v] : data.items())
+                    items.push_back(v);
 
-    return true;
+            ok = true;
+        } catch (...) {
+            nd_printf("%s: warning: JSON parse error from %s\n",
+                GetTag().c_str(), endpoint.c_str());
+            line.clear();
+        }
+    }
+
+    pclose(f);
+    return ok;
 }
 
 // ── DownloadNetifyData ────────────────────────────────────────────────────────
