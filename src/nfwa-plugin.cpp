@@ -491,6 +491,9 @@ void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
 
     const string other_ip = other_addr.GetString();
 
+    // sdwrt_interactive is ipv4_addr typed — skip IPv6 addresses
+    if (other_ip.find(':') != string::npos) return;
+
     if (event == ndPluginDetection::EVENT_EXPIRING) {
         auto [set, ttl] = FindMatchingSet(flow);
         if (!set.empty())
