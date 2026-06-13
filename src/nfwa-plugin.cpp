@@ -360,7 +360,9 @@ void nfwaPlugin::InitNftables()
     const char *cmds =
         "add table inet sd_wrt\n"
         "add set inet sd_wrt sdwrt_interactive "
-            "{ type ipv4_addr; flags timeout; }\n";
+            "{ type ipv4_addr; flags timeout; }\n"
+        "add set inet sd_wrt sdwrt_interactive6 "
+            "{ type ipv6_addr; flags timeout; }\n";
 
     if (nft_run_cmd_from_buffer(nft_ctx_, cmds) != 0)
         nd_printf("%s: warning: nftables init returned non-zero\n", GetTag().c_str());
@@ -491,13 +493,13 @@ void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
 
     const string other_ip = other_addr.GetString();
 
-    // sdwrt_interactive is ipv4_addr typed — skip IPv6 addresses
-    if (other_ip.find(':') != string::npos) return;
+    // Route IPv6 addresses to the parallel ipv6_addr-typed set.
+    bool is_ipv6 = (other_ip.find(':') != string::npos);
 
     if (event == ndPluginDetection::EVENT_EXPIRING) {
         auto [set, ttl] = FindMatchingSet(flow);
         if (!set.empty())
-            RemoveFromSet(set, other_ip);
+            RemoveFromSet(is_ipv6 ? set + "6" : set, other_ip);
         return;
     }
 
@@ -505,7 +507,7 @@ void nfwaPlugin::ProcessFlow(ndDetectionEvent event, ndFlow *flow)
         event == ndPluginDetection::EVENT_UPDATED) {
         auto [set, ttl] = FindMatchingSet(flow);
         if (!set.empty())
-            AddToSet(set, other_ip, ttl);
+            AddToSet(is_ipv6 ? set + "6" : set, other_ip, ttl);
     }
 }
 
